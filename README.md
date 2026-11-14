@@ -4,7 +4,16 @@
 
 ## 模块与业务流程
 数据接入（JSON/CSV、字段验证、批次指纹）→ 参数化分析（异步 Python worker）→ 结果复核（指标、图形、明细、解释、批准）→ 定时分发（本地收件箱、CSV/JSON、SHA256）；另有业务总览和审计轨迹。
-三个贯穿全栈的实体：Dataset 数据批次、Job 分析任务、Report 分发计划；辅助 User、Audit、Delivery。
+三个贯穿全栈的实体：Dataset 数据批次、Job 分析任务、Report 分发计划；辅助 User、Audit、ReportPeriod 期次（旧版 Delivery 仅用于历史归档迁移）。
+
+### 分发期次（ReportPeriod）约定
+- 期次按**原定到期时刻** `anchor_at + period_index × interval_seconds` 划分，不使用"当前时刻 + 周期"；worker 重启、延迟执行都不会让计划漂移。
+- 每个期次由 `(report_id, period_index)` 唯一约束保护，worker 以条件更新（CAS）领取；多 worker 并发或崩溃后重试，同一期只归档一次。
+- 首次领取期次时**冻结**批准结果快照；之后所有重试与补发都复用该快照，重新计算或重新批准不会改变已冻结内容。
+- CSV 与 JSON 先写临时文件并 fsync，再原子改名；两份文件各自 SHA256 且交叉校验结果指纹一致后才标记 `completed`。写一半中断只留临时文件，期次仍可被重新领取恢复。
+- 下载前重新校验两份文件与登记指纹；受损时标记 `corrupted`、返回原因并拒绝下载，**原件保留不覆盖**（仅 `failed` 期次允许管理员重试，冻结内容不变）。
+- 漏过的多期由 worker 逐期补齐（默认每轮最多 `CATCHUP_BATCH` 期），每期独立归档；暂停计划后不再生成新期次，恢复后未到期次继续补齐。
+- 页面 `/reports` 展示每条计划及每期状态、原定到期时刻与失败原因。
 
 ## 快速启动
 ```bash
@@ -33,7 +42,7 @@ Role 枚举：admin/analyst/viewer；JobStatus：queued/running/completed/failed
 
 ## 环境变量与 Docker
 COMPOSE_PROJECT_NAME=fleet-weibull；FRONTEND_PORT=18216；BACKEND_PORT=19216；DB_PORT=17716；DB_PASSWORD、JWT_SECRET 见 .env.example；SEED_DEMO 默认 true。共享命名产物卷供后端下载与 worker 写入，数据库/Redis 各持久卷。
-恰好五服务均有健康检查。Redis 队列加 SQL 排队状态兜底；worker 按 next_run 生成本地收件箱文件。周期 60 秒至 30 天。分发结果为批准分析的固定快照；若需新数据重新计算并建立新计划。当前不连接邮件或企业聊天。
+恰好五服务均有健康检查。Redis 队列加 SQL 排队状态兜底；worker 按期次原定到期时刻生成本地收件箱文件，并支持并发投递。周期 60 秒至 30 天。分发结果为批准分析的固定快照；若需新数据重新计算并建立新计划。当前不连接邮件或企业聊天。
 错误响应、请求编号、Redis 每 IP 每分钟 240 次限流、JWT 和数据库操作审计。演示密钥与密码仅供本机模拟；生产部署前配置独立密钥与账号。
 
 ## 数据与验收
